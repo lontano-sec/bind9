@@ -1,0 +1,693 @@
+/*
+ * Copyright (C) Internet Systems Consortium, Inc. ("ISC")
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * See the COPYRIGHT file distributed with this work for additional
+ * information regarding copyright ownership.
+ */
+
+/*! \file */
+
+#include <bind.keys.h>
+#include <defaultconfig.h>
+#include <inttypes.h>
+#include <stdlib.h>
+
+#include <isc/buffer.h>
+#include <isc/dir.h>
+#include <isc/file.h>
+#include <isc/log.h>
+#include <isc/mem.h>
+#include <isc/netmgr.h>
+#include <isc/parseint.h>
+#include <isc/region.h>
+#include <isc/result.h>
+#include <isc/sockaddr.h>
+#include <isc/string.h>
+#include <isc/util.h>
+
+#include <dns/fixedname.h>
+#include <dns/kasp.h>
+#include <dns/name.h>
+#include <dns/rdataclass.h>
+#include <dns/rdatatype.h>
+#include <dns/tsig.h>
+#include <dns/zone.h>
+
+#include <dst/dst.h>
+
+#include <isccfg/check.h>
+#include <isccfg/grammar.h>
+#include <isccfg/namedconf.h>
+
+#include <named/config.h>
+#include <named/globals.h>
+
+isc_result_t
+named_config_parsedefaults(cfg_obj_t **conf) {
+	isc_buffer_t b;
+
+	isc_buffer_constinit(&b, common_named_defaultconf,
+			     sizeof(common_named_defaultconf) - 1);
+	isc_buffer_add(&b, sizeof(common_named_defaultconf) - 1);
+	return cfg_parse_buffer(
+		isc_g_mctx, &b, __FILE__, 0, &cfg_type_namedconf,
+		CFG_PCTX_NODEPRECATED | CFG_PCTX_NOOBSOLETE |
+			CFG_PCTX_NOEXPERIMENTAL | CFG_PCTX_BUILTIN,
+		conf);
+}
+
+isc_result_t
+named_config_parsefile(cfg_obj_t **conf) {
+	isc_result_t result;
+
+	REQUIRE(conf && *conf == NULL);
+
+	isc_log_write(NAMED_LOGCATEGORY_GENERAL, NAMED_LOGMODULE_SERVER,
+		      ISC_LOG_INFO, "parsing user configuration from '%s'",
+		      named_g_conffile);
+
+	result = cfg_parse_file(isc_g_mctx, named_g_conffile,
+				&cfg_type_namedconf, 0, conf);
+	if (result != ISC_R_SUCCESS) {
+		goto cleanup;
+	}
+
+	/*
+	 * Check the validity of the configuration.
+	 *
+	 * (Ignore plugin parameters for now; they will be
+	 * checked later when the modules are actually loaded and
+	 * registered.)
+	 */
+	result = isccfg_check_namedconf(*conf, BIND_CHECK_ALGORITHMS,
+					isc_g_mctx);
+	if (result != ISC_R_SUCCESS) {
+		goto cleanup;
+	}
+
+	goto out;
+
+cleanup:
+	if (*conf) {
+		cfg_obj_detach(conf);
+	}
+
+out:
+	return result;
+}
+
+isc_result_t
+named_config_get(cfg_obj_t const *const *maps, const char *name,
+		 const cfg_obj_t **obj) {
+	int i;
+
+	for (i = 0; maps[i] != NULL; i++) {
+		if (cfg_map_get(maps[i], name, obj) == ISC_R_SUCCESS) {
+			return ISC_R_SUCCESS;
+		}
+	}
+	return ISC_R_NOTFOUND;
+}
+
+isc_result_t
+named_config_findopt(const cfg_obj_t *opts1, const cfg_obj_t *opts2,
+		     const char *name, const cfg_obj_t **objp) {
+	isc_result_t result = ISC_R_NOTFOUND;
+
+	REQUIRE(*objp == NULL);
+
+	if (opts1 != NULL) {
+		result = cfg_map_get(opts1, name, objp);
+	}
+	if (*objp == NULL && opts2 != NULL) {
+		result = cfg_map_get(opts2, name, objp);
+	}
+
+	return result;
+}
+
+isc_result_t
+named_checknames_get(const cfg_obj_t **maps, const char *const names[],
+		     const cfg_obj_t **obj) {
+	const cfg_obj_t *checknames = NULL;
+	const cfg_obj_t *type = NULL;
+	const cfg_obj_t *value = NULL;
+	int i;
+
+	REQUIRE(maps != NULL);
+	REQUIRE(names != NULL);
+	REQUIRE(obj != NULL && *obj == NULL);
+
+	for (i = 0; maps[i] != NULL; i++) {
+		checknames = NULL;
+		if (cfg_map_get(maps[i], "check-names", &checknames) ==
+		    ISC_R_SUCCESS)
+		{
+			/*
+			 * Zone map entry is not a list.
+			 */
+			if (checknames != NULL && !cfg_obj_islist(checknames)) {
+				*obj = checknames;
+				return ISC_R_SUCCESS;
+			}
+			CFG_LIST_FOREACH(checknames, element) {
+				value = cfg_listelt_value(element);
+				type = cfg_tuple_get(value, "type");
+
+				for (size_t j = 0; names[j] != NULL; j++) {
+					if (strcasecmp(cfg_obj_asstring(type),
+						       names[j]) == 0)
+					{
+						*obj = cfg_tuple_get(value,
+								     "mode");
+						return ISC_R_SUCCESS;
+					}
+				}
+			}
+		}
+	}
+	return ISC_R_NOTFOUND;
+}
+
+int
+named_config_listcount(const cfg_obj_t *list) {
+	int i = 0;
+
+	CFG_LIST_FOREACH(list, e) {
+		i++;
+	}
+
+	return i;
+}
+
+isc_result_t
+named_config_getclass(const cfg_obj_t *classobj, dns_rdataclass_t defclass,
+		      dns_rdataclass_t *classp) {
+	isc_textregion_t r;
+	isc_result_t result;
+
+	if (!cfg_obj_isstring(classobj)) {
+		*classp = defclass;
+		return ISC_R_SUCCESS;
+	}
+	r.base = UNCONST(cfg_obj_asstring(classobj));
+	r.length = strlen(r.base);
+	result = dns_rdataclass_fromtext(classp, &r);
+	if (result != ISC_R_SUCCESS) {
+		cfg_obj_log(classobj, ISC_LOG_ERROR, "unknown class '%s'",
+			    r.base);
+	}
+	return result;
+}
+
+isc_result_t
+named_config_gettype(const cfg_obj_t *typeobj, dns_rdatatype_t deftype,
+		     dns_rdatatype_t *typep) {
+	isc_textregion_t r;
+	isc_result_t result;
+
+	if (!cfg_obj_isstring(typeobj)) {
+		*typep = deftype;
+		return ISC_R_SUCCESS;
+	}
+	r.base = UNCONST(cfg_obj_asstring(typeobj));
+	r.length = strlen(r.base);
+	result = dns_rdatatype_fromtext(typep, &r);
+	if (result != ISC_R_SUCCESS) {
+		cfg_obj_log(typeobj, ISC_LOG_ERROR, "unknown type '%s'",
+			    r.base);
+	}
+	return result;
+}
+
+dns_zonetype_t
+named_config_getzonetype(const cfg_obj_t *zonetypeobj) {
+	dns_zonetype_t ztype = dns_zone_none;
+	const char *str;
+
+	str = cfg_obj_asstring(zonetypeobj);
+	if (strcasecmp(str, "primary") == 0 || strcasecmp(str, "master") == 0) {
+		ztype = dns_zone_primary;
+	} else if (strcasecmp(str, "secondary") == 0 ||
+		   strcasecmp(str, "slave") == 0)
+	{
+		ztype = dns_zone_secondary;
+	} else if (strcasecmp(str, "mirror") == 0) {
+		ztype = dns_zone_mirror;
+	} else if (strcasecmp(str, "stub") == 0) {
+		ztype = dns_zone_stub;
+	} else if (strcasecmp(str, "static-stub") == 0) {
+		ztype = dns_zone_staticstub;
+	} else if (strcasecmp(str, "redirect") == 0) {
+		ztype = dns_zone_redirect;
+	} else {
+		UNREACHABLE();
+	}
+	return ztype;
+}
+
+isc_result_t
+named_config_getremotesdef(const cfg_obj_t *cctx, const char *list,
+			   const char *name, const cfg_obj_t **ret) {
+	isc_result_t result;
+	const cfg_obj_t *obj = NULL;
+
+	REQUIRE(cctx != NULL);
+	REQUIRE(name != NULL);
+	REQUIRE(ret != NULL && *ret == NULL);
+
+	result = cfg_map_get(cctx, list, &obj);
+	if (result != ISC_R_SUCCESS) {
+		return result;
+	}
+	CFG_LIST_FOREACH(obj, elt) {
+		obj = cfg_listelt_value(elt);
+		if (strcasecmp(cfg_obj_asstring(cfg_tuple_get(obj, "name")),
+			       name) == 0)
+		{
+			*ret = obj;
+			return ISC_R_SUCCESS;
+		}
+	}
+
+	return ISC_R_NOTFOUND;
+}
+
+static isc_result_t
+named_config_getname(isc_mem_t *mctx, const cfg_obj_t *obj,
+		     dns_name_t **namep) {
+	REQUIRE(namep != NULL && *namep == NULL);
+
+	const char *objstr;
+	isc_result_t result;
+	isc_buffer_t b;
+	dns_fixedname_t fname;
+
+	if (!cfg_obj_isstring(obj)) {
+		*namep = NULL;
+		return ISC_R_SUCCESS;
+	}
+
+	*namep = isc_mem_get(mctx, sizeof(**namep));
+	dns_name_init(*namep);
+
+	objstr = cfg_obj_asstring(obj);
+	isc_buffer_constinit(&b, objstr, strlen(objstr));
+	isc_buffer_add(&b, strlen(objstr));
+	dns_fixedname_init(&fname);
+	result = dns_name_fromtext(dns_fixedname_name(&fname), &b, dns_rootname,
+				   0);
+	if (result != ISC_R_SUCCESS) {
+		isc_mem_put(mctx, *namep, sizeof(**namep));
+		return result;
+	}
+	dns_name_dup(dns_fixedname_name(&fname), mctx, *namep);
+
+	return ISC_R_SUCCESS;
+}
+
+#define grow_array(mctx, array, newlen, oldlen)                          \
+	if (newlen >= oldlen) {                                          \
+		array = isc_mem_creget(mctx, array, oldlen, newlen + 16, \
+				       sizeof(array[0]));                \
+		oldlen = newlen + 16;                                    \
+	}
+
+#define shrink_array(mctx, array, newlen, oldlen)                   \
+	if (newlen < oldlen) {                                      \
+		array = isc_mem_creget(mctx, array, oldlen, newlen, \
+				       sizeof(array[0]));           \
+		oldlen = newlen;                                    \
+	}
+
+static const char *remotesnames[4] = { "remote-servers", "parental-agents",
+				       "primaries", "masters" };
+
+isc_result_t
+named_config_getipandkeylist(const cfg_obj_t *config, const cfg_obj_t *list,
+			     isc_mem_t *mctx, dns_ipkeylist_t *ipkl) {
+	uint32_t addrcount = 0, srccount = 0;
+	uint32_t keycount = 0, tlscount = 0;
+	uint32_t listcount = 0, l = 0, i = 0;
+	uint32_t stackcount = 0, pushed = 0;
+	isc_result_t result;
+	const cfg_listelt_t *element;
+	const cfg_obj_t *addrlist;
+	const cfg_obj_t *portobj;
+	const cfg_obj_t *src4obj;
+	const cfg_obj_t *src6obj;
+	in_port_t port = (in_port_t)0;
+	in_port_t def_port;
+	in_port_t def_tlsport;
+	isc_sockaddr_t src4;
+	isc_sockaddr_t src6;
+	isc_sockaddr_t *addrs = NULL;
+	isc_sockaddr_t *sources = NULL;
+	dns_name_t **keys = NULL;
+	dns_name_t **tlss = NULL;
+	struct {
+		const char *name;
+		in_port_t port;
+		isc_sockaddr_t *src4s;
+		isc_sockaddr_t *src6s;
+	} *lists = NULL;
+	struct {
+		const cfg_listelt_t *element;
+		in_port_t port;
+		isc_sockaddr_t src4;
+		isc_sockaddr_t src6;
+	} *stack = NULL;
+
+	REQUIRE(ipkl != NULL);
+	REQUIRE(ipkl->count == 0);
+	REQUIRE(ipkl->addrs == NULL);
+	REQUIRE(ipkl->keys == NULL);
+	REQUIRE(ipkl->tlss == NULL);
+	REQUIRE(ipkl->labels == NULL);
+	REQUIRE(ipkl->allocated == 0);
+
+	/*
+	 * Get system defaults.
+	 */
+	result = named_config_getport(config, "port", &def_port);
+	if (result != ISC_R_SUCCESS) {
+		goto cleanup;
+	}
+
+	result = named_config_getport(config, "tls-port", &def_tlsport);
+	if (result != ISC_R_SUCCESS) {
+		goto cleanup;
+	}
+
+newlist:
+	addrlist = cfg_tuple_get(list, "addresses");
+	portobj = cfg_tuple_get(list, "port");
+	src4obj = cfg_tuple_get(list, "source");
+	src6obj = cfg_tuple_get(list, "source-v6");
+
+	if (cfg_obj_isuint32(portobj)) {
+		uint32_t val = cfg_obj_asuint32(portobj);
+		if (val > UINT16_MAX) {
+			cfg_obj_log(portobj, ISC_LOG_ERROR,
+				    "port '%u' out of range", val);
+			result = ISC_R_RANGE;
+			goto cleanup;
+		}
+		port = (in_port_t)val;
+	}
+
+	if (src4obj != NULL && cfg_obj_issockaddr(src4obj)) {
+		src4 = *cfg_obj_assockaddr(src4obj);
+	} else {
+		isc_sockaddr_any(&src4);
+	}
+
+	if (src6obj != NULL && cfg_obj_issockaddr(src6obj)) {
+		src6 = *cfg_obj_assockaddr(src6obj);
+	} else {
+		isc_sockaddr_any6(&src6);
+	}
+
+	element = cfg_list_first(addrlist);
+resume:
+	for (; element != NULL; element = cfg_list_next(element)) {
+		const cfg_obj_t *addr;
+		const cfg_obj_t *key;
+		const cfg_obj_t *tls;
+
+		addr = cfg_tuple_get(cfg_listelt_value(element),
+				     "remoteselement");
+		key = cfg_tuple_get(cfg_listelt_value(element), "key");
+		tls = cfg_tuple_get(cfg_listelt_value(element), "tls");
+
+		if (!cfg_obj_issockaddr(addr)) {
+			const char *listname = cfg_obj_asstring(addr);
+			isc_result_t tresult;
+			uint32_t j;
+
+			/* Grow lists? */
+			grow_array(mctx, lists, l, listcount);
+
+			/* Seen? */
+			for (j = 0; j < l; j++) {
+				if (strcasecmp(lists[j].name, listname) == 0) {
+					break;
+				}
+			}
+			if (j < l) {
+				continue;
+			}
+			list = NULL;
+			tresult = ISC_R_NOTFOUND;
+			for (size_t n = 0; n < ARRAY_SIZE(remotesnames); n++) {
+				tresult = named_config_getremotesdef(
+					config, remotesnames[n], listname,
+					&list);
+				if (tresult == ISC_R_SUCCESS) {
+					break;
+				}
+			}
+			if (tresult == ISC_R_NOTFOUND) {
+				cfg_obj_log(addr, ISC_LOG_ERROR,
+					    "remote-servers \"%s\" not found",
+					    listname);
+			}
+			if (tresult != ISC_R_SUCCESS) {
+				result = tresult;
+				goto cleanup;
+			}
+			lists[l++].name = listname;
+			/* Grow stack? */
+			grow_array(mctx, stack, pushed, stackcount);
+			/*
+			 * We want to resume processing this list on the
+			 * next element.
+			 */
+			stack[pushed].element = cfg_list_next(element);
+			stack[pushed].port = port;
+			stack[pushed].src4 = src4;
+			stack[pushed].src6 = src6;
+			pushed++;
+			goto newlist;
+		}
+
+		grow_array(mctx, addrs, i, addrcount);
+		grow_array(mctx, keys, i, keycount);
+		grow_array(mctx, tlss, i, tlscount);
+		grow_array(mctx, sources, i, srccount);
+
+		addrs[i] = *cfg_obj_assockaddr(addr);
+
+		result = named_config_getname(mctx, key, &keys[i]);
+		if (result != ISC_R_SUCCESS) {
+			i++; /* Increment here so that cleanup on error works.
+			      */
+			goto cleanup;
+		}
+
+		result = named_config_getname(mctx, tls, &tlss[i]);
+		if (result != ISC_R_SUCCESS) {
+			i++; /* Increment here so that cleanup on error works.
+			      */
+			goto cleanup;
+		}
+
+		/* If the port is unset, take it from one of the upper levels */
+		if (isc_sockaddr_getport(&addrs[i]) == 0) {
+			in_port_t addr_port = port;
+
+			/* If unset, use the default port or tls-port */
+			if (addr_port == 0) {
+				if (tlss[i] != NULL) {
+					addr_port = def_tlsport;
+				} else {
+					addr_port = def_port;
+				}
+			}
+
+			isc_sockaddr_setport(&addrs[i], addr_port);
+		}
+
+		switch (isc_sockaddr_pf(&addrs[i])) {
+		case PF_INET:
+			sources[i] = src4;
+			break;
+		case PF_INET6:
+			sources[i] = src6;
+			break;
+		default:
+			i++; /* Increment here so that cleanup on error works.
+			      */
+			result = ISC_R_NOTIMPLEMENTED;
+			goto cleanup;
+		}
+
+		i++;
+	}
+	if (pushed != 0) {
+		pushed--;
+		element = stack[pushed].element;
+		port = stack[pushed].port;
+		src4 = stack[pushed].src4;
+		src6 = stack[pushed].src6;
+		goto resume;
+	}
+
+	shrink_array(mctx, addrs, i, addrcount);
+	shrink_array(mctx, keys, i, keycount);
+	shrink_array(mctx, tlss, i, tlscount);
+	shrink_array(mctx, sources, i, srccount);
+
+	if (lists != NULL) {
+		isc_mem_cput(mctx, lists, listcount, sizeof(lists[0]));
+	}
+	if (stack != NULL) {
+		isc_mem_cput(mctx, stack, stackcount, sizeof(stack[0]));
+	}
+
+	INSIST(keycount == addrcount);
+	INSIST(tlscount == addrcount);
+	INSIST(srccount == addrcount);
+
+	ipkl->addrs = addrs;
+	ipkl->keys = keys;
+	ipkl->tlss = tlss;
+	ipkl->sources = sources;
+	ipkl->count = addrcount;
+	ipkl->allocated = addrcount;
+
+	return ISC_R_SUCCESS;
+
+cleanup:
+	if (addrs != NULL) {
+		isc_mem_cput(mctx, addrs, addrcount, sizeof(addrs[0]));
+	}
+	if (keys != NULL) {
+		for (size_t j = 0; j < i; j++) {
+			if (keys[j] == NULL) {
+				continue;
+			}
+			if (dns_name_dynamic(keys[j])) {
+				dns_name_free(keys[j], mctx);
+			}
+			isc_mem_put(mctx, keys[j], sizeof(*keys[j]));
+		}
+		isc_mem_cput(mctx, keys, keycount, sizeof(keys[0]));
+	}
+	if (tlss != NULL) {
+		for (size_t j = 0; j < i; j++) {
+			if (tlss[j] == NULL) {
+				continue;
+			}
+			if (dns_name_dynamic(tlss[j])) {
+				dns_name_free(tlss[j], mctx);
+			}
+			isc_mem_put(mctx, tlss[j], sizeof(*tlss[j]));
+		}
+		isc_mem_cput(mctx, tlss, tlscount, sizeof(tlss[0]));
+	}
+	if (sources != NULL) {
+		isc_mem_cput(mctx, sources, srccount, sizeof(sources[0]));
+	}
+	if (lists != NULL) {
+		isc_mem_cput(mctx, lists, listcount, sizeof(lists[0]));
+	}
+	if (stack != NULL) {
+		isc_mem_cput(mctx, stack, stackcount, sizeof(stack[0]));
+	}
+	return result;
+}
+
+isc_result_t
+named_config_getport(const cfg_obj_t *config, const char *type,
+		     in_port_t *portp) {
+	const cfg_obj_t *maps[3];
+	const cfg_obj_t *options = NULL;
+	const cfg_obj_t *portobj = NULL;
+	isc_result_t result;
+	int i;
+
+	(void)cfg_map_get(config, "options", &options);
+	i = 0;
+	if (options != NULL) {
+		maps[i++] = options;
+	}
+	maps[i] = NULL;
+
+	result = named_config_get(maps, type, &portobj);
+	INSIST(result == ISC_R_SUCCESS);
+	if (cfg_obj_asuint32(portobj) >= UINT16_MAX) {
+		cfg_obj_log(portobj, ISC_LOG_ERROR, "port '%u' out of range",
+			    cfg_obj_asuint32(portobj));
+		return ISC_R_RANGE;
+	}
+	*portp = (in_port_t)cfg_obj_asuint32(portobj);
+	return ISC_R_SUCCESS;
+}
+
+struct keyalgorithms {
+	const char *str;
+	enum {
+		hmacnone,
+		hmacmd5,
+		hmacsha1,
+		hmacsha224,
+		hmacsha256,
+		hmacsha384,
+		hmacsha512
+	} hmac;
+	unsigned int type;
+	uint16_t size;
+} algorithms[] = { { "hmac-md5", hmacmd5, DST_ALG_HMACMD5, 128 },
+		   { "hmac-md5.sig-alg.reg.int", hmacmd5, DST_ALG_HMACMD5, 0 },
+		   { "hmac-md5.sig-alg.reg.int.", hmacmd5, DST_ALG_HMACMD5, 0 },
+		   { "hmac-sha1", hmacsha1, DST_ALG_HMACSHA1, 160 },
+		   { "hmac-sha224", hmacsha224, DST_ALG_HMACSHA224, 224 },
+		   { "hmac-sha256", hmacsha256, DST_ALG_HMACSHA256, 256 },
+		   { "hmac-sha384", hmacsha384, DST_ALG_HMACSHA384, 384 },
+		   { "hmac-sha512", hmacsha512, DST_ALG_HMACSHA512, 512 },
+		   { NULL, hmacnone, DST_ALG_UNKNOWN, 0 } };
+
+isc_result_t
+named_config_getkeyalgorithm(const char *str, unsigned int *typep,
+			     uint16_t *digestbits) {
+	int i;
+	size_t len = 0;
+	uint16_t bits;
+	isc_result_t result;
+
+	for (i = 0; algorithms[i].str != NULL; i++) {
+		len = strlen(algorithms[i].str);
+		if (strncasecmp(algorithms[i].str, str, len) == 0 &&
+		    (str[len] == '\0' ||
+		     (algorithms[i].size != 0 && str[len] == '-')))
+		{
+			break;
+		}
+	}
+	if (algorithms[i].str == NULL) {
+		return ISC_R_NOTFOUND;
+	}
+	if (str[len] == '-') {
+		result = isc_parse_uint16(&bits, str + len + 1, 10);
+		if (result != ISC_R_SUCCESS) {
+			return result;
+		}
+		if (bits > algorithms[i].size) {
+			return ISC_R_RANGE;
+		}
+	} else if (algorithms[i].size == 0) {
+		bits = 128;
+	} else {
+		bits = algorithms[i].size;
+	}
+	SET_IF_NOT_NULL(typep, algorithms[i].type);
+	SET_IF_NOT_NULL(digestbits, bits);
+	return ISC_R_SUCCESS;
+}

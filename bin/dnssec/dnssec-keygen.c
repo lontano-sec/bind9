@@ -1,0 +1,1214 @@
+/*
+ * Portions Copyright (C) Internet Systems Consortium, Inc. ("ISC")
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, you can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * See the COPYRIGHT file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * Portions Copyright (C) Network Associates, Inc.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND ISC AND NETWORK ASSOCIATES DISCLAIMS
+ * ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS.  IN NO EVENT SHALL ISC BE LIABLE
+ * FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+ * IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*! \file */
+
+#include <ctype.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include <openssl/opensslv.h>
+
+#include <isc/attributes.h>
+#include <isc/buffer.h>
+#include <isc/commandline.h>
+#include <isc/crypto.h>
+#include <isc/lib.h>
+#include <isc/log.h>
+#include <isc/mem.h>
+#include <isc/region.h>
+#include <isc/result.h>
+#include <isc/string.h>
+#include <isc/util.h>
+
+#include <dns/dnssec.h>
+#include <dns/fixedname.h>
+#include <dns/kasp.h>
+#include <dns/keyvalues.h>
+#include <dns/lib.h>
+#include <dns/name.h>
+#include <dns/rdataclass.h>
+#include <dns/secalg.h>
+
+#include <dst/dst.h>
+
+#include "dnssectool.h"
+
+/*
+ * These are are set here for backwards compatibility.  They are
+ * raised to 2048 in FIPS mode.
+ */
+static int min_rsa = 1024;
+static int min_dh = 128;
+
+ISC_NORETURN static void
+usage(int ret);
+
+static void
+progress(int p);
+
+struct keygen_ctx {
+	const char *predecessor;
+	const char *policy;
+	const char *configfile;
+	const char *directory;
+	dns_keystore_t *keystore;
+	char *algname;
+	int size;
+	uint16_t tag_min;
+	uint16_t tag_max;
+	dns_rdataclass_t rdclass;
+	int options;
+	dns_ttl_t ttl;
+	bool wantzsk;
+	bool wantksk;
+	bool wantrev;
+	dst_algorithm_t alg;
+	/* timing data */
+	int prepub;
+	isc_stdtime_t now;
+	isc_stdtime_t publish;
+	isc_stdtime_t activate;
+	isc_stdtime_t inactive;
+	isc_stdtime_t revokekey;
+	isc_stdtime_t deltime;
+	isc_stdtime_t syncadd;
+	isc_stdtime_t syncdel;
+	bool setpub;
+	bool setact;
+	bool setinact;
+	bool setrev;
+	bool setdel;
+	bool setsyncadd;
+	bool setsyncdel;
+	bool unsetpub;
+	bool unsetact;
+	bool unsetinact;
+	bool unsetrev;
+	bool unsetdel;
+	/* how to generate the key */
+	bool setttl;
+	bool use_nsec3;
+	bool genonly;
+	bool showprogress;
+	bool quiet;
+	bool oldstyle;
+	/* state */
+	time_t lifetime;
+	bool ksk;
+	bool zsk;
+};
+
+typedef struct keygen_ctx keygen_ctx_t;
+
+static void
+usage(int ret) {
+	fprintf(stderr, "Usage:\n");
+	fprintf(stderr, "    %s [options] name\n\n", isc_commandline_progname);
+	fprintf(stderr, "Version: %s\n", PACKAGE_VERSION);
+	fprintf(stderr, "    name: owner of the key\n");
+	fprintf(stderr, "Options:\n");
+	fprintf(stderr, "    -K <directory>: write keys into directory\n");
+	fprintf(stderr, "    -k <policy>: generate keys for dnssec-policy\n");
+	fprintf(stderr, "    -l <file>: configuration file with dnssec-policy "
+			"statement\n");
+	fprintf(stderr, "    -a <algorithm>:\n");
+	if (!isc_crypto_fips_mode()) {
+		fprintf(stderr, "        RSASHA1 (deprecated) | NSEC3RSASHA1 "
+				"(deprecated) |\n");
+	}
+	fprintf(stderr, "        RSASHA256 | RSASHA512 |\n");
+	fprintf(stderr, "        ECDSAP256SHA256 | ECDSAP384SHA384 |\n");
+	fprintf(stderr, "        ED25519 | ED448\n");
+	fprintf(stderr, "    -3: use NSEC3-capable algorithm\n");
+	fprintf(stderr, "    -b <key size in bits>:\n");
+	if (!isc_crypto_fips_mode()) {
+		fprintf(stderr, "        RSASHA1 (deprecated) :\t[%d..%d]\n",
+			min_rsa, MAX_RSA);
+		fprintf(stderr,
+			"        NSEC3RSASHA1 (deprecated) :\t[%d..%d]\n",
+			min_rsa, MAX_RSA);
+	}
+	fprintf(stderr, "        RSASHA256:\t[%d..%d]\n", min_rsa, MAX_RSA);
+	fprintf(stderr, "        RSASHA512:\t[%d..%d]\n", min_rsa, MAX_RSA);
+	fprintf(stderr, "        ECDSAP256SHA256:\tignored\n");
+	fprintf(stderr, "        ECDSAP384SHA384:\tignored\n");
+	fprintf(stderr, "        ED25519:\tignored\n");
+	fprintf(stderr, "        ED448:\tignored\n");
+	fprintf(stderr, "        (key size defaults are set according to\n"
+			"        algorithm and usage (ZSK or KSK)\n");
+	fprintf(stderr, "    -c <class>: (default: IN)\n");
+	fprintf(stderr, "    -d <digest bits> (0 => max, default)\n");
+	fprintf(stderr, "    -f <keyflag>: ZSK | KSK | REVOKE\n");
+	fprintf(stderr, "    -F: FIPS mode\n");
+	fprintf(stderr, "    -L <ttl>: default key TTL\n");
+	fprintf(stderr, "    -M <min>:<max>: allowed Key ID range\n");
+	fprintf(stderr, "    -T <rrtype>: DNSKEY | KEY (default: DNSKEY; "
+			"use KEY for SIG(0))\n");
+	fprintf(stderr, "    -h: print usage and exit\n");
+	fprintf(stderr, "    -m <memory debugging mode>:\n");
+	fprintf(stderr, "       usage | trace | record\n");
+	fprintf(stderr, "    -v <level>: set verbosity level (0 - 10)\n");
+	fprintf(stderr, "    -V: print version information\n");
+	fprintf(stderr, "Timing options:\n");
+	fprintf(stderr, "    -P date/[+-]offset/none: set key publication date "
+			"(default: now)\n");
+	fprintf(stderr, "    -P sync date/[+-]offset/none: set CDS and CDNSKEY "
+			"publication date\n");
+	fprintf(stderr, "    -A date/[+-]offset/none: set key activation date "
+			"(default: now)\n");
+	fprintf(stderr, "    -R date/[+-]offset/none: set key "
+			"revocation date\n");
+	fprintf(stderr, "    -I date/[+-]offset/none: set key "
+			"inactivation date\n");
+	fprintf(stderr, "    -D date/[+-]offset/none: set key deletion date\n");
+	fprintf(stderr, "    -D sync date/[+-]offset/none: set CDS and CDNSKEY "
+			"deletion date\n");
+
+	fprintf(stderr, "    -G: generate key only; do not set -P or -A\n");
+	fprintf(stderr, "    -C: generate a backward-compatible key, omitting "
+			"all dates\n");
+	fprintf(stderr, "    -S <key>: generate a successor to an existing "
+			"key\n");
+	fprintf(stderr, "    -i <interval>: prepublication interval for "
+			"successor key "
+			"(default: 30 days)\n");
+	fprintf(stderr, "Output:\n");
+	fprintf(stderr, "     K<name>+<alg>+<id>.key, "
+			"K<name>+<alg>+<id>.private\n");
+
+	exit(ret);
+}
+
+static void
+progress(int p) {
+	char c = '*';
+
+	switch (p) {
+	case 0:
+		c = '.';
+		break;
+	case 1:
+		c = '+';
+		break;
+	case 2:
+		c = '*';
+		break;
+	case 3:
+		c = ' ';
+		break;
+	default:
+		break;
+	}
+	(void)putc(c, stderr);
+	(void)fflush(stderr);
+}
+
+static void
+keygen(keygen_ctx_t *ctx, int argc, char **argv) {
+	char filename[255];
+	char algstr[DNS_SECALG_FORMATSIZE];
+	uint16_t flags = 0;
+	bool null_key = false;
+	bool conflict = false;
+	bool show_progress = false;
+	isc_buffer_t buf;
+	dns_name_t *name;
+	dns_fixedname_t fname;
+	isc_result_t ret;
+	dst_key_t *key = NULL;
+	dst_key_t *prevkey = NULL;
+
+	UNUSED(argc);
+
+	dst_algorithm_format(ctx->alg, algstr, sizeof(algstr));
+
+	if (ctx->predecessor == NULL) {
+		if (ctx->prepub == -1) {
+			ctx->prepub = 0;
+		}
+
+		name = dns_fixedname_initname(&fname);
+		isc_buffer_init(&buf, argv[isc_commandline_index],
+				strlen(argv[isc_commandline_index]));
+		isc_buffer_add(&buf, strlen(argv[isc_commandline_index]));
+		ret = dns_name_fromtext(name, &buf, dns_rootname, 0);
+		if (ret != ISC_R_SUCCESS) {
+			fatal("invalid key name %s: %s",
+			      argv[isc_commandline_index],
+			      isc_result_totext(ret));
+		}
+
+		if (!dst_algorithm_supported(ctx->alg)) {
+			fatal("unsupported algorithm: %s", algstr);
+		}
+
+		if (isc_crypto_fips_mode()) {
+			/* verify only in FIPS mode */
+			switch (ctx->alg) {
+			case DST_ALG_RSASHA1:
+			case DST_ALG_NSEC3RSASHA1:
+				fatal("unsupported algorithm: %s", algstr);
+			default:
+				break;
+			}
+		}
+
+		if (ctx->use_nsec3) {
+			switch (ctx->alg) {
+			case DST_ALG_RSASHA1:
+				ctx->alg = DST_ALG_NSEC3RSASHA1;
+				break;
+			case DST_ALG_NSEC3RSASHA1:
+			case DST_ALG_RSASHA256:
+			case DST_ALG_RSASHA512:
+			case DST_ALG_RSASHA256PRIVATEOID:
+			case DST_ALG_RSASHA512PRIVATEOID:
+			case DST_ALG_ECDSA256:
+			case DST_ALG_ECDSA384:
+			case DST_ALG_ED25519:
+			case DST_ALG_ED448:
+				break;
+			default:
+				fatal("algorithm %s is incompatible with NSEC3"
+				      ", do not use the -3 option",
+				      algstr);
+			}
+		}
+
+		if (ctx->size < 0) {
+			switch (ctx->alg) {
+			case DST_ALG_RSASHA1:
+			case DST_ALG_NSEC3RSASHA1:
+				if (isc_crypto_fips_mode()) {
+					fatal("key size not specified (-b "
+					      "option)");
+				}
+				FALLTHROUGH;
+			case DST_ALG_RSASHA256:
+			case DST_ALG_RSASHA512:
+			case DST_ALG_RSASHA256PRIVATEOID:
+			case DST_ALG_RSASHA512PRIVATEOID:
+				ctx->size = 2048;
+				if (verbose > 0) {
+					fprintf(stderr,
+						"key size not "
+						"specified; defaulting"
+						" to %d\n",
+						ctx->size);
+				}
+				break;
+			case DST_ALG_ECDSA256:
+			case DST_ALG_ECDSA384:
+			case DST_ALG_ED25519:
+			case DST_ALG_ED448:
+				break;
+			default:
+				fatal("key size not specified (-b option)");
+			}
+		}
+
+		if (!ctx->oldstyle && ctx->prepub > 0) {
+			if (ctx->setpub && ctx->setact &&
+			    (ctx->activate - ctx->prepub) < ctx->publish)
+			{
+				fatal("Activation and publication dates "
+				      "are closer together than the\n\t"
+				      "prepublication interval.");
+			}
+
+			if (!ctx->setpub && !ctx->setact) {
+				ctx->setpub = ctx->setact = true;
+				ctx->publish = ctx->now;
+				ctx->activate = ctx->now + ctx->prepub;
+			} else if (ctx->setpub && !ctx->setact) {
+				ctx->setact = true;
+				ctx->activate = ctx->publish + ctx->prepub;
+			} else if (ctx->setact && !ctx->setpub) {
+				ctx->setpub = true;
+				ctx->publish = ctx->activate - ctx->prepub;
+			}
+
+			if ((ctx->activate - ctx->prepub) < ctx->now) {
+				fatal("Time until activation is shorter "
+				      "than the\n\tprepublication interval.");
+			}
+		}
+	} else {
+		char keystr[DST_KEY_FORMATSIZE];
+		isc_stdtime_t when;
+		int major, minor;
+
+		if (ctx->prepub == -1) {
+			ctx->prepub = (30 * 86400);
+		}
+
+		if (ctx->alg != 0) {
+			fatal("-S and -a cannot be used together");
+		}
+		if (ctx->size >= 0) {
+			fatal("-S and -b cannot be used together");
+		}
+		if (ctx->setpub || ctx->unsetpub) {
+			fatal("-S and -P cannot be used together");
+		}
+		if (ctx->setact || ctx->unsetact) {
+			fatal("-S and -A cannot be used together");
+		}
+		if (ctx->use_nsec3) {
+			fatal("-S and -3 cannot be used together");
+		}
+		if (ctx->oldstyle) {
+			fatal("-S and -C cannot be used together");
+		}
+		if (ctx->genonly) {
+			fatal("-S and -G cannot be used together");
+		}
+
+		ret = dst_key_fromnamedfile(ctx->predecessor, ctx->directory,
+					    DST_TYPE_PUBLIC | DST_TYPE_PRIVATE |
+						    DST_TYPE_STATE,
+					    isc_g_mctx, &prevkey);
+		if (ret != ISC_R_SUCCESS) {
+			fatal("Invalid keyfile %s: %s", ctx->predecessor,
+			      isc_result_totext(ret));
+		}
+		if (!dst_key_isprivate(prevkey)) {
+			fatal("%s is not a private key", ctx->predecessor);
+		}
+
+		name = dst_key_name(prevkey);
+		ctx->alg = dst_key_alg(prevkey);
+		ctx->size = dst_key_size(prevkey);
+		flags = dst_key_flags(prevkey);
+
+		dst_key_format(prevkey, keystr, sizeof(keystr));
+		dst_key_getprivateformat(prevkey, &major, &minor);
+		if (major != DST_MAJOR_VERSION || minor < DST_MINOR_VERSION) {
+			fatal("Key %s has incompatible format version %d.%d\n\t"
+			      "It is not possible to generate a successor key.",
+			      keystr, major, minor);
+		}
+
+		ret = dst_key_gettime(prevkey, DST_TIME_ACTIVATE, &when);
+		if (ret != ISC_R_SUCCESS) {
+			fatal("Key %s has no activation date.\n\t"
+			      "You must use dnssec-settime -A to set one "
+			      "before generating a successor.",
+			      keystr);
+		}
+
+		ret = dst_key_gettime(prevkey, DST_TIME_INACTIVE,
+				      &ctx->activate);
+		if (ret != ISC_R_SUCCESS) {
+			fatal("Key %s has no inactivation date.\n\t"
+			      "You must use dnssec-settime -I to set one "
+			      "before generating a successor.",
+			      keystr);
+		}
+
+		ctx->publish = ctx->activate - ctx->prepub;
+		if (ctx->publish < ctx->now) {
+			fatal("Key %s becomes inactive\n\t"
+			      "sooner than the prepublication period "
+			      "for the new key ends.\n\t"
+			      "Either change the inactivation date with "
+			      "dnssec-settime -I,\n\t"
+			      "or use the -i option to set a shorter "
+			      "prepublication interval.",
+			      keystr);
+		}
+
+		ret = dst_key_gettime(prevkey, DST_TIME_DELETE, &when);
+		if (ret != ISC_R_SUCCESS) {
+			fprintf(stderr,
+				"%s: WARNING: Key %s has no removal "
+				"date;\n\t it will remain in the zone "
+				"indefinitely after rollover.\n\t "
+				"You can use dnssec-settime -D to "
+				"change this.\n",
+				isc_commandline_progname, keystr);
+		}
+
+		ctx->setpub = ctx->setact = true;
+	}
+
+	switch (ctx->alg) {
+	case DST_ALG_RSASHA1:
+	case DST_ALG_NSEC3RSASHA1:
+		dns_secalg_format(ctx->alg, algstr, sizeof(algstr));
+		fprintf(stderr,
+			"WARNING: DNSKEY algorithm '%s' is deprecated. Please "
+			"migrate to another algorithm\n",
+			algstr);
+		break;
+	default:
+		break;
+	}
+
+	switch (ctx->alg) {
+	case DST_ALG_RSASHA1:
+	case DST_ALG_NSEC3RSASHA1:
+		if (isc_crypto_fips_mode()) {
+			fatal("SHA1 based keys not supported in FIPS mode");
+		}
+		FALLTHROUGH;
+	case DST_ALG_RSASHA256:
+	case DST_ALG_RSASHA512:
+	case DST_ALG_RSASHA256PRIVATEOID:
+	case DST_ALG_RSASHA512PRIVATEOID:
+		if (ctx->size != 0 &&
+		    (ctx->size < min_rsa || ctx->size > MAX_RSA))
+		{
+			fatal("RSA key size %d out of range", ctx->size);
+		}
+		break;
+	case DST_ALG_ECDSA256:
+		ctx->size = 256;
+		break;
+	case DST_ALG_ECDSA384:
+		ctx->size = 384;
+		break;
+	case DST_ALG_ED25519:
+		ctx->size = 256;
+		break;
+	case DST_ALG_ED448:
+		ctx->size = 456;
+		break;
+	default:
+		fatal("not a dnskey algorithm %u\n", ctx->alg);
+	}
+
+	if ((ctx->options & DST_TYPE_KEY) == 0) {
+		flags |= DNS_KEYOWNER_ZONE; /* DNSKEY: name type ZONE */
+	} else {
+		flags |= DNS_KEYOWNER_ENTITY; /* KEY: name type HOST */
+	}
+
+	if (ctx->directory == NULL) {
+		ctx->directory = ".";
+	}
+
+	if ((flags & DNS_KEYOWNER_ZONE) != 0) { /* DNSKEY */
+		if (ctx->ksk || ctx->wantksk) {
+			flags |= DNS_KEYFLAG_KSK;
+		}
+		if (ctx->wantrev) {
+			flags |= DNS_KEYFLAG_REVOKE;
+		}
+	}
+
+	switch (ctx->alg) {
+	case DST_ALG_RSASHA1:
+	case DST_ALG_NSEC3RSASHA1:
+	case DST_ALG_RSASHA256:
+	case DST_ALG_RSASHA512:
+		show_progress = true;
+		break;
+
+	case DST_ALG_ECDSA256:
+	case DST_ALG_ECDSA384:
+	case DST_ALG_ED25519:
+	case DST_ALG_ED448:
+		show_progress = true;
+		break;
+	default:
+		break;
+	}
+
+	if ((flags & DNS_KEYFLAG_TYPEMASK) == DNS_KEYTYPE_NOKEY &&
+	    (ctx->options & DST_TYPE_KEY) != 0)
+	{
+		null_key = true;
+	}
+
+	isc_buffer_init(&buf, filename, sizeof(filename) - 1);
+
+	do {
+		conflict = false;
+
+		if (!ctx->quiet && show_progress) {
+			fprintf(stderr, "Generating key pair.");
+		}
+
+		if (ctx->keystore != NULL && ctx->policy != NULL) {
+			ret = dns_keystore_keygen(
+				ctx->keystore, name, ctx->policy, ctx->rdclass,
+				isc_g_mctx, ctx->alg, ctx->size, flags, &key);
+		} else if (!ctx->quiet && show_progress) {
+			ret = dst_key_generate(name, ctx->alg, ctx->size, 0,
+					       flags, DNS_KEYPROTO_DNSSEC,
+					       ctx->rdclass, NULL, isc_g_mctx,
+					       &key, &progress);
+		} else {
+			ret = dst_key_generate(name, ctx->alg, ctx->size, 0,
+					       flags, DNS_KEYPROTO_DNSSEC,
+					       ctx->rdclass, NULL, isc_g_mctx,
+					       &key, NULL);
+		}
+
+		if (!ctx->quiet && show_progress) {
+			putc('\n', stderr);
+			fflush(stderr);
+		}
+
+		if (ret != ISC_R_SUCCESS) {
+			char namestr[DNS_NAME_FORMATSIZE];
+			dns_name_format(name, namestr, sizeof(namestr));
+			fatal("failed to generate key %s/%s: %s\n", namestr,
+			      algstr, isc_result_totext(ret));
+		}
+
+		/*
+		 * Set key timing metadata (unless using -C)
+		 *
+		 * Creation date is always set to "now".
+		 *
+		 * For a new key without an explicit predecessor, publish
+		 * and activation dates are set to "now" by default, but
+		 * can both be overridden.
+		 *
+		 * For a successor key, activation is set to match the
+		 * predecessor's inactivation date.  Publish is set to 30
+		 * days earlier than that (XXX: this should be configurable).
+		 * If either of the resulting dates are in the past, that's
+		 * an error; the inactivation date of the predecessor key
+		 * must be updated before a successor key can be created.
+		 */
+		if (!ctx->oldstyle) {
+			dst_key_settime(key, DST_TIME_CREATED, ctx->now);
+
+			if (ctx->genonly && (ctx->setpub || ctx->setact)) {
+				fatal("cannot use -G together with "
+				      "-P or -A options");
+			}
+
+			if (ctx->setpub) {
+				dst_key_settime(key, DST_TIME_PUBLISH,
+						ctx->publish);
+			} else if (ctx->setact && !ctx->unsetpub) {
+				dst_key_settime(key, DST_TIME_PUBLISH,
+						ctx->activate - ctx->prepub);
+			} else if (!ctx->genonly && !ctx->unsetpub) {
+				dst_key_settime(key, DST_TIME_PUBLISH,
+						ctx->now);
+			}
+
+			if (ctx->setact) {
+				dst_key_settime(key, DST_TIME_ACTIVATE,
+						ctx->activate);
+			} else if (!ctx->genonly && !ctx->unsetact) {
+				dst_key_settime(key, DST_TIME_ACTIVATE,
+						ctx->now);
+			}
+
+			if (ctx->setrev) {
+				if (!ctx->wantksk) {
+					fprintf(stderr,
+						"%s: warning: Key is "
+						"not flagged as a KSK, but -R "
+						"was used. Revoking a ZSK is "
+						"legal, but undefined.\n",
+						isc_commandline_progname);
+				}
+				dst_key_settime(key, DST_TIME_REVOKE,
+						ctx->revokekey);
+			}
+
+			if (ctx->setinact) {
+				dst_key_settime(key, DST_TIME_INACTIVE,
+						ctx->inactive);
+			}
+
+			if (ctx->setdel) {
+				if (ctx->setinact &&
+				    ctx->deltime < ctx->inactive)
+				{
+					fprintf(stderr,
+						"%s: warning: Key is "
+						"scheduled to be deleted "
+						"before it is scheduled to be "
+						"made inactive.\n",
+						isc_commandline_progname);
+				}
+				dst_key_settime(key, DST_TIME_DELETE,
+						ctx->deltime);
+			}
+
+			if (ctx->setsyncadd) {
+				dst_key_settime(key, DST_TIME_SYNCPUBLISH,
+						ctx->syncadd);
+			}
+
+			if (ctx->setsyncdel) {
+				dst_key_settime(key, DST_TIME_SYNCDELETE,
+						ctx->syncdel);
+			}
+		} else {
+			if (ctx->setpub || ctx->setact || ctx->setrev ||
+			    ctx->setinact || ctx->setdel || ctx->unsetpub ||
+			    ctx->unsetact || ctx->unsetrev || ctx->unsetinact ||
+			    ctx->unsetdel || ctx->genonly || ctx->setsyncadd ||
+			    ctx->setsyncdel)
+			{
+				fatal("cannot use -C together with "
+				      "-P, -A, -R, -I, -D, or -G options");
+			}
+			/*
+			 * Compatibility mode: Private-key-format
+			 * should be set to 1.2.
+			 */
+			dst_key_setprivateformat(key, 1, 2);
+		}
+
+		/* Set the default key TTL */
+		if (ctx->setttl) {
+			dst_key_setttl(key, ctx->ttl);
+		}
+
+		/* Set dnssec-policy related metadata */
+		if (ctx->policy != NULL) {
+			dst_key_setnum(key, DST_NUM_LIFETIME, ctx->lifetime);
+			dst_key_setbool(key, DST_BOOL_KSK, ctx->ksk);
+			dst_key_setbool(key, DST_BOOL_ZSK, ctx->zsk);
+		}
+
+		/*
+		 * Do not overwrite an existing key, or create a key
+		 * if there is a risk of ID collision due to this key
+		 * or another key being revoked.
+		 */
+		if (key_collision(key, name, ctx->directory, isc_g_mctx,
+				  ctx->tag_min, ctx->tag_max, NULL))
+		{
+			conflict = true;
+			if (null_key) {
+				dst_key_free(&key);
+				break;
+			}
+
+			if (verbose > 0) {
+				isc_buffer_clear(&buf);
+				ret = dst_key_buildfilename(
+					key, 0, ctx->directory, &buf);
+				if (ret == ISC_R_SUCCESS) {
+					fprintf(stderr,
+						"%s: %s already exists, or "
+						"might collide with another "
+						"key upon revokation.  "
+						"Generating a new key\n",
+						isc_commandline_progname,
+						filename);
+				}
+			}
+
+			dst_key_free(&key);
+		}
+	} while (conflict);
+
+	if (conflict) {
+		fatal("cannot generate a null key due to possible key ID "
+		      "collision");
+	}
+
+	if (ctx->predecessor != NULL && prevkey != NULL) {
+		dst_key_setnum(prevkey, DST_NUM_SUCCESSOR, dst_key_id(key));
+		dst_key_setnum(key, DST_NUM_PREDECESSOR, dst_key_id(prevkey));
+
+		ret = dst_key_tofile(prevkey, ctx->options, ctx->directory);
+		if (ret != ISC_R_SUCCESS) {
+			char keystr[DST_KEY_FORMATSIZE];
+			dst_key_format(prevkey, keystr, sizeof(keystr));
+			fatal("failed to update predecessor %s: %s\n", keystr,
+			      isc_result_totext(ret));
+		}
+	}
+
+	ret = dst_key_tofile(key, ctx->options, ctx->directory);
+	if (ret != ISC_R_SUCCESS) {
+		char keystr[DST_KEY_FORMATSIZE];
+		dst_key_format(key, keystr, sizeof(keystr));
+		fatal("failed to write key %s: %s\n", keystr,
+		      isc_result_totext(ret));
+	}
+
+	isc_buffer_clear(&buf);
+	ret = dst_key_buildfilename(key, 0, NULL, &buf);
+	if (ret != ISC_R_SUCCESS) {
+		fatal("dst_key_buildfilename returned: %s\n",
+		      isc_result_totext(ret));
+	}
+	printf("%s\n", filename);
+
+	dst_key_free(&key);
+	if (prevkey != NULL) {
+		dst_key_free(&prevkey);
+	}
+}
+
+static void
+check_keystore_options(keygen_ctx_t *ctx) {
+	ctx->directory = dns_keystore_directory(ctx->keystore, NULL);
+	if (ctx->directory != NULL) {
+		isc_result_t ret = try_dir(ctx->directory);
+		if (ret != ISC_R_SUCCESS) {
+			fatal("cannot open directory %s: %s", ctx->directory,
+			      isc_result_totext(ret));
+		}
+	}
+}
+
+int
+main(int argc, char **argv) {
+	char *algname = NULL, *freeit = NULL;
+	char *classname = NULL;
+	char *endp;
+	isc_result_t ret;
+	isc_textregion_t r;
+	unsigned char c;
+	int ch;
+
+	keygen_ctx_t ctx = {
+		.options = DST_TYPE_PRIVATE | DST_TYPE_PUBLIC,
+		.prepub = -1,
+		.size = -1,
+		.now = isc_stdtime_now(),
+	};
+
+	if (argc == 1) {
+		usage(EXIT_FAILURE);
+	}
+
+	isc_commandline_init(argc, argv);
+
+	isc_commandline_errprint = false;
+
+	/*
+	 * Process memory debugging argument first.
+	 */
+#define CMDLINE_FLAGS                                          \
+	"3A:a:b:Cc:D:d:E:Ff:GhI:i:K:k:L:l:M:m:n:P:p:qR:r:S:s:" \
+	"T:t:v:V"
+	while ((ch = isc_commandline_parse(argc, argv, CMDLINE_FLAGS)) != -1) {
+		switch (ch) {
+		case 'm':
+			if (strcasecmp(isc_commandline_argument, "record") == 0)
+			{
+				isc_mem_debugon(ISC_MEM_DEBUGRECORD);
+			}
+			if (strcasecmp(isc_commandline_argument, "trace") == 0)
+			{
+				isc_mem_debugon(ISC_MEM_DEBUGTRACE);
+			}
+			if (strcasecmp(isc_commandline_argument, "usage") == 0)
+			{
+				isc_mem_debugon(ISC_MEM_DEBUGUSAGE);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+	isc_commandline_reset = true;
+
+	while ((ch = isc_commandline_parse(argc, argv, CMDLINE_FLAGS)) != -1) {
+		switch (ch) {
+		case '3':
+			ctx.use_nsec3 = true;
+			break;
+		case 'a':
+			algname = isc_commandline_argument;
+			break;
+		case 'b':
+			ctx.size = strtol(isc_commandline_argument, &endp, 10);
+			if (*endp != '\0' || ctx.size < 0) {
+				fatal("-b requires a non-negative number");
+			}
+			break;
+		case 'C':
+			ctx.oldstyle = true;
+			break;
+		case 'c':
+			classname = isc_commandline_argument;
+			break;
+		case 'd':
+			fatal("The -d option has been deprecated.");
+			break;
+		case 'E':
+			fatal("%s", isc_result_totext(DST_R_NOENGINE));
+			break;
+		case 'f':
+			c = (unsigned char)(isc_commandline_argument[0]);
+			if (toupper(c) == 'K') {
+				ctx.wantksk = true;
+			} else if (toupper(c) == 'Z') {
+				ctx.wantzsk = true;
+			} else if (toupper(c) == 'R') {
+				ctx.wantrev = true;
+			} else {
+				fatal("unknown flag '%s'",
+				      isc_commandline_argument);
+			}
+			break;
+		case 'K':
+			ctx.directory = isc_commandline_argument;
+			ret = try_dir(ctx.directory);
+			if (ret != ISC_R_SUCCESS) {
+				fatal("cannot open directory %s: %s",
+				      ctx.directory, isc_result_totext(ret));
+			}
+			break;
+		case 'k':
+			ctx.policy = isc_commandline_argument;
+			break;
+		case 'L':
+			ctx.ttl = strtottl(isc_commandline_argument);
+			ctx.setttl = true;
+			break;
+		case 'l':
+			ctx.configfile = isc_commandline_argument;
+			break;
+		case 'n':
+			fatal("The -n option has been deprecated.");
+			break;
+		case 'M': {
+			unsigned long ul;
+			ctx.tag_min = ul = strtoul(isc_commandline_argument,
+						   &endp, 10);
+			if (*endp != ':' || ul > 0xffff) {
+				fatal("-M range invalid");
+			}
+			ctx.tag_max = ul = strtoul(endp + 1, &endp, 10);
+			if (*endp != '\0' || ul > 0xffff ||
+			    ctx.tag_max <= ctx.tag_min)
+			{
+				fatal("-M range invalid");
+			}
+			break;
+		}
+		case 'm':
+			break;
+		case 'p':
+			fatal("The -p option has been deprecated.");
+			break;
+		case 'q':
+			ctx.quiet = true;
+			break;
+		case 'r':
+			fatal("The -r option has been deprecated.\n"
+			      "System random data is always used.\n");
+			break;
+		case 's':
+			fatal("The -s option has been deprecated.");
+			break;
+		case 'T':
+			if (strcasecmp(isc_commandline_argument, "KEY") == 0) {
+				ctx.options |= DST_TYPE_KEY;
+			} else if (strcasecmp(isc_commandline_argument,
+					      "DNSKEY") == 0)
+			{
+				/* default behavior */
+			} else {
+				fatal("unknown type '%s'",
+				      isc_commandline_argument);
+			}
+			break;
+		case 't':
+			fatal("The -t option has been deprecated.");
+			break;
+		case 'v':
+			endp = NULL;
+			verbose = strtol(isc_commandline_argument, &endp, 0);
+			if (*endp != '\0') {
+				fatal("-v must be followed by a number");
+			}
+			break;
+		case 'G':
+			ctx.genonly = true;
+			break;
+		case 'P':
+			/* -Psync ? */
+			if (isoptarg("sync", argv, usage)) {
+				if (ctx.setsyncadd) {
+					fatal("-P sync specified more than "
+					      "once");
+				}
+
+				ctx.syncadd = strtotime(
+					isc_commandline_argument, ctx.now,
+					ctx.now, &ctx.setsyncadd);
+				break;
+			}
+			(void)isoptarg("dnskey", argv, usage);
+			if (ctx.setpub || ctx.unsetpub) {
+				fatal("-P specified more than once");
+			}
+
+			ctx.publish = strtotime(isc_commandline_argument,
+						ctx.now, ctx.now, &ctx.setpub);
+			ctx.unsetpub = !ctx.setpub;
+			break;
+		case 'A':
+			if (ctx.setact || ctx.unsetact) {
+				fatal("-A specified more than once");
+			}
+
+			ctx.activate = strtotime(isc_commandline_argument,
+						 ctx.now, ctx.now, &ctx.setact);
+			ctx.unsetact = !ctx.setact;
+			break;
+		case 'R':
+			if (ctx.setrev || ctx.unsetrev) {
+				fatal("-R specified more than once");
+			}
+
+			ctx.revokekey = strtotime(isc_commandline_argument,
+						  ctx.now, ctx.now,
+						  &ctx.setrev);
+			ctx.unsetrev = !ctx.setrev;
+			break;
+		case 'I':
+			if (ctx.setinact || ctx.unsetinact) {
+				fatal("-I specified more than once");
+			}
+
+			ctx.inactive = strtotime(isc_commandline_argument,
+						 ctx.now, ctx.now,
+						 &ctx.setinact);
+			ctx.unsetinact = !ctx.setinact;
+			break;
+		case 'D':
+			/* -Dsync ? */
+			if (isoptarg("sync", argv, usage)) {
+				if (ctx.setsyncdel) {
+					fatal("-D sync specified more than "
+					      "once");
+				}
+
+				ctx.syncdel = strtotime(
+					isc_commandline_argument, ctx.now,
+					ctx.now, &ctx.setsyncdel);
+				break;
+			}
+			(void)isoptarg("dnskey", argv, usage);
+			if (ctx.setdel || ctx.unsetdel) {
+				fatal("-D specified more than once");
+			}
+
+			ctx.deltime = strtotime(isc_commandline_argument,
+						ctx.now, ctx.now, &ctx.setdel);
+			ctx.unsetdel = !ctx.setdel;
+			break;
+		case 'S':
+			ctx.predecessor = isc_commandline_argument;
+			break;
+		case 'i':
+			ctx.prepub = strtottl(isc_commandline_argument);
+			break;
+		case 'F':
+			if (isc_crypto_fips_enable() != ISC_R_SUCCESS) {
+				fatal("setting FIPS mode failed");
+			}
+			break;
+		case '?':
+			if (isc_commandline_option != '?') {
+				fprintf(stderr, "%s: invalid argument -%c\n",
+					isc_commandline_progname,
+					isc_commandline_option);
+			}
+			/* Does not return. */
+			usage(EXIT_FAILURE);
+
+		case 'h':
+			/* Does not return. */
+			usage(EXIT_SUCCESS);
+
+		case 'V':
+			/* Does not return. */
+			version(isc_commandline_progname);
+
+		default:
+			fprintf(stderr, "%s: unhandled option -%c\n",
+				isc_commandline_progname,
+				isc_commandline_option);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	if (!isatty(0)) {
+		ctx.quiet = true;
+	}
+
+	/*
+	 * The DST subsystem will set FIPS mode if requested at build time.
+	 * The minimum sizes are both raised to 2048.
+	 */
+	if (isc_crypto_fips_mode()) {
+		min_rsa = min_dh = 2048;
+	}
+
+	setup_logging();
+
+	ctx.rdclass = strtoclass(classname);
+
+	if (ctx.configfile == NULL || ctx.configfile[0] == '\0') {
+		ctx.configfile = NAMED_CONFFILE;
+	}
+
+	if (ctx.predecessor == NULL) {
+		if (argc < isc_commandline_index + 1) {
+			fatal("the key name was not specified");
+		}
+		if (argc > isc_commandline_index + 1) {
+			fatal("extraneous arguments");
+		}
+	}
+
+	if (ctx.predecessor == NULL && ctx.policy == NULL) {
+		if (algname == NULL) {
+			fatal("no algorithm specified");
+		}
+		r.base = algname;
+		r.length = strlen(algname);
+		ret = dst_algorithm_fromtext(&ctx.alg, &r);
+		if (ret != ISC_R_SUCCESS) {
+			fatal("unknown algorithm %s", algname);
+		}
+		if (!dst_algorithm_supported(ctx.alg)) {
+			fatal("unsupported algorithm: %s", algname);
+		}
+	}
+
+	if (ctx.policy != NULL) {
+		if (ctx.predecessor != NULL) {
+			fatal("-k and -S cannot be used together");
+		}
+		if (ctx.oldstyle) {
+			fatal("-k and -C cannot be used together");
+		}
+		if (ctx.setttl) {
+			fatal("-k and -L cannot be used together");
+		}
+		if (ctx.prepub > 0) {
+			fatal("-k and -i cannot be used together");
+		}
+		if (ctx.size != -1) {
+			fatal("-k and -b cannot be used together");
+		}
+		if (ctx.wantrev) {
+			fatal("-k and -fR cannot be used together");
+		}
+		if ((ctx.options & DST_TYPE_KEY) != 0) {
+			fatal("-k and -T KEY cannot be used together");
+		}
+		if (ctx.use_nsec3) {
+			fatal("-k and -3 cannot be used together");
+		}
+
+		ctx.options |= DST_TYPE_STATE;
+
+		if (strcmp(ctx.policy, "default") == 0) {
+			ctx.use_nsec3 = false;
+			ctx.alg = DST_ALG_ECDSA256;
+			ctx.size = 0;
+			ctx.ttl = 3600;
+			ctx.setttl = true;
+			ctx.ksk = true;
+			ctx.zsk = true;
+			ctx.lifetime = 0;
+			ctx.tag_min = 0;
+			ctx.tag_max = 0xffff;
+
+			keygen(&ctx, argc, argv);
+		} else {
+			cfg_obj_t *config = NULL;
+			dns_kasp_t *kasp = NULL;
+
+			if (cfg_parse_file(isc_g_mctx, ctx.configfile,
+					   &cfg_type_namedconf, 0,
+					   &config) != ISC_R_SUCCESS)
+			{
+				fatal("unable to load dnssec-policy '%s' from "
+				      "'%s'",
+				      ctx.policy, ctx.configfile);
+			}
+
+			kasp_from_conf(config, isc_g_mctx, ctx.policy,
+				       ctx.directory, &kasp);
+			if (kasp == NULL) {
+				fatal("failed to load dnssec-policy '%s'",
+				      ctx.policy);
+			}
+			if (ISC_LIST_EMPTY(dns_kasp_keys(kasp))) {
+				fatal("dnssec-policy '%s' has no keys "
+				      "configured",
+				      ctx.policy);
+			}
+
+			ctx.ttl = dns_kasp_dnskeyttl(kasp);
+			ctx.setttl = true;
+
+			ISC_LIST_FOREACH(dns_kasp_keys(kasp), kaspkey, link) {
+				ctx.use_nsec3 = false;
+				ctx.alg = dns_kasp_key_algorithm(kaspkey);
+				ctx.size = dns_kasp_key_size(kaspkey);
+				ctx.ksk = dns_kasp_key_ksk(kaspkey);
+				ctx.zsk = dns_kasp_key_zsk(kaspkey);
+				ctx.lifetime = dns_kasp_key_lifetime(kaspkey);
+				ctx.keystore = dns_kasp_key_keystore(kaspkey);
+				if (ctx.keystore != NULL) {
+					check_keystore_options(&ctx);
+				}
+				ctx.tag_min = dns_kasp_key_tagmin(kaspkey);
+				ctx.tag_max = dns_kasp_key_tagmax(kaspkey);
+				if ((ctx.ksk && !ctx.wantksk && ctx.wantzsk) ||
+				    (ctx.zsk && !ctx.wantzsk && ctx.wantksk))
+				{
+					continue;
+				}
+				keygen(&ctx, argc, argv);
+			}
+
+			dns_kasp_detach(&kasp);
+			cfg_obj_detach(&config);
+		}
+	} else {
+		keygen(&ctx, argc, argv);
+	}
+
+	if (verbose > 10) {
+		isc_mem_stats(isc_g_mctx, stdout);
+	}
+
+	if (freeit != NULL) {
+		free(freeit);
+	}
+
+	return 0;
+}
